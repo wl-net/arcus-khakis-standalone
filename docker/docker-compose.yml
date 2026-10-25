@@ -1,4 +1,13 @@
-version: '3'
+# mem_limit caps resident memory so one runaway container can't take the
+# host down. Limits are caps, not reservations: they're sized above
+# observed usage, and swap is left available.
+x-logging: &default-logging
+  options:
+    max-size: 50m
+    # Keep rotated files: a busy hour of INFO logs can rotate a single file
+    # past an incident window before anyone looks
+    max-file: "3"
+
 services:
   cassandra-0:
     image: us-west1-docker.pkg.dev/arcus-238802/arcus-prod/arcus/cassandra:latest
@@ -16,23 +25,45 @@ services:
     - "9160:9160"
     volumes:
     - cassandra-storage-0:/data
+    # Logs on tmpfs (image can't write to /var/log/cassandra on disk), but
+    # capped: an uncapped tmpfs can grow to half the host's RAM
+    - type: tmpfs
+      target: /var/log/cassandra
+      tmpfs:
+        size: 134217728 # 128 MiB (startup logging alone reaches ~52 MiB)
+    ulimits:
+      memlock: -1
+      nofile: 100000
+    # Cassandra flushes memtables on SIGTERM; the 10s default means SIGKILL
+    # mid-flush and commitlog replay on every restart
+    stop_grace_period: 2m
+    mem_limit: 1792m
     networks:
       arcus:
         ipv4_address: 192.168.1.10
     restart: always
+    logging: *default-logging
   zookeeper-0:
-    image: zookeeper:3.6
+    image: zookeeper:3.8.7
     environment:
       ZOO_MY_ID: 1
       ZOO_SERVERS: server.1=192.168.1.13:2888:3888;2181
+      # Image default heap is 1000m, which would outgrow mem_limit and get
+      # the JVM OOM-killed; observed usage is ~60 MiB
+      ZK_SERVER_HEAP: 256
     ports:
     - "2181:2181"
+    mem_limit: 512m
     volumes:
     - zookeeper-0:/data
+    # The image's txn logs live in /datalog; without a named volume they
+    # land on an anonymous one that 'compose down' discards
+    - zookeeper-0-datalog:/datalog
     networks:
       arcus:
         ipv4_address: 192.168.1.13
     restart: always
+    logging: *default-logging
   kafka-0:
     image: us-west1-docker.pkg.dev/arcus-238802/arcus-prod/arcus/kafka:latest
     environment:
@@ -51,7 +82,11 @@ services:
       KAFKA_REPLICATOR_SELECTOR_CLASS: org.apache.kafka.common.replica.RackAwareReplicaSelector
       KAFKA_PROTOCOL_VERSION: 2.8
       KAFKA_LOG_MESSAGE_VERSION: 2.8
+      KAFKA_LOG4J_ROOT_LOGLEVEL: WARN
     restart: always
+    stop_grace_period: 1m
+    # Observed ~420 MiB with the 512M heap; the rest is page cache
+    mem_limit: 1g
     ports:
     - "9092:9092"
     volumes:
@@ -59,17 +94,17 @@ services:
     networks:
       arcus:
         ipv4_address: 192.168.1.14
+    logging: *default-logging
 
 volumes:
   cassandra-storage-0:
   cassandra-storage-1:
   cassandra-storage-2:
   zookeeper-0:
+  zookeeper-0-datalog:
   kafka-0:
 
 networks:
-  private:
-
   arcus:
     driver: bridge
     ipam:
